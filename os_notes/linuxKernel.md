@@ -77,3 +77,79 @@ CFS允许每个进程运行一段时间，循环轮转，选择最少运行的�
 调度器实体结构作为成员变量，嵌入在进程描述符struct task_sturct中。`vruntime`是一个加权的运行时间，和定时器节拍无关，（可以理解为运行的进度？？），使用该变量来记录一个程序到底运行的多长时间以及还要运行多久。完美的任务调度中，vruntime应该是一致的，所以linux在调度的时候，选择最小vruntime的任务来运行。
 
 CFS使用`红黑树`来组织可运行进程队列，可以迅速找到最小的vruntime值。
+
+
+## 内核同步方法
+
+### 原子操作
+
+原子整数操作：只能对atomic_t类型的数据进行处理。使用这种类型一是确保原子操作只与这种特殊的数据操作，另一个是确保编译器不对数据进行访问优化。
+```C
+typedef struct {
+    volatile int counter;
+} atomic_t;
+
+atomic_t v;
+atomic_t u = ATOMIC_INT(0);
+
+atomic_set(&v, 4);
+atomic_add(2, &v);
+atomic_inc(&v);
+atocic_read(&v);
+
+// 64bit
+typedef struct {
+    volatile long counter;
+} atomic64_t;
+```
+原子操作表：
+![atomic_t](./pic/atomic_t.png)
+
+原子位操作：原子位操作函数对普通的内存地址进行操作，参数是一个指针和一个位号。
+```C
+unsigned long word = 0;
+
+set_bit(0, &word);
+set_bit(1, &word);
+clear_bit(0, &word);
+```
+原子操作表：
+![atomic_bit](./pic/atomic_bit.png)
+
+### 自旋锁
+
+自旋锁和互斥锁不太相同，自旋锁在没有获得锁时会一直忙循环-旋转-等待锁重新可用，而不会将进程睡眠。
+```c
+DEFINE_SPINLOCK(mr_lock);
+spin_lock(&mr_lock);
+// do sth
+spin_unlock(&mr_lock);
+```
+
+自旋锁可以使用在中断处理程序中（不能使用信号量，会导致睡眠），在获取锁之前，一定要关中断，负责一旦中断处理程序也想获得这个锁，就会有请求保持的情况发生，导致死锁。内核提供了请求锁同时禁止中断的函数
+```c
+DEFINE_SPINLOCK(mr_lock);
+unsigned long flags;
+spin_lock_irqsave(&mr_lock, flags);
+// do sth
+spin_unlock_irqrestore(&mr_lock, flags);
+```
+
+### 信号量
+
+信号量是一种睡眠锁。
+- 适用于锁长期持有的情况，否则，调度的时间可能和锁持有的时间差不多。
+- 只能在进程上下文中获取，在中断上下文中不能获取
+- 可以在持有信号量时睡眠（持有自旋锁关中断）
+- 占有信号量的同时不能占用自旋锁
+
+关于自旋锁和互斥锁
+
+|需求 | 加锁方法|
+|:--:|--|
+|低开销枷锁|自旋锁|
+|短期锁定| 自旋锁 |
+| 长期加锁 | 互斥锁 |
+| 中断上下文加锁 | 自旋锁 |
+| 持有锁需要睡眠 | 互斥锁 |
+
