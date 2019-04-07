@@ -43,3 +43,10 @@ The kernel stub has four tasks:
 - Copy back any result
 
 ![stubs](./pic/stubs.png)
+
+### Start a new process
+
+The kernel allocates and initializes the pcb, allocates memory for the process, copies the program from disk into the newly allocated memory, allocates both user-level stack and kernel-level stack. Two additioinal steps:
+
+- Copy arguments into user memory (copy to user stack)
+- Transfer control to user-mode (iret)
