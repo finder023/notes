@@ -153,3 +153,133 @@ spin_unlock_irqrestore(&mr_lock, flags);
 | 中断上下文加锁 | 自旋锁 |
 | 持有锁需要睡眠 | 互斥锁 |
 
+### 顺序锁
+
+通常简称seq锁，实现主要依靠一个序列计数器，当数据被写入时，会得到一个锁，并且序列值会增加，在读取数据之前和之后，序列号都会被读取，如果读取的序列号相同，则说明读操作过程中没有被写打断。如果读取的值时偶数，表明写操作没有发生（锁初值为0，写锁会使其变成奇数，释放时再变成偶数）
+```c
+seqlock_t mr_seq_lock = DEFINE_SEQLOCK(mr_seq_lock);
+write_seqlock(&mr_seq_lock);
+// write lock
+write_sequnlock(&mr_seq_lock);
+
+// read
+unsigned long seq;
+do {
+    seq = read_seqbegin(&mr_seq_lock);
+    // read
+} while (read_seqretry(&mr_seq_lock, seq));
+```
+seq锁适合一下场合：
+- 数据存在很多读者
+- 写者很少
+- 写者虽然少，但是希望写优先于读
+- 数据很简单，无法使用原子操作
+
+## 内存管理
+
+```c
+struct page {
+    unsigned                flags;
+    atomic_t                _count;     // 引用计数
+    atomic_t                _mapcount;
+    unsigned long           private;
+    struct address_space    *mapping;   // 被页缓存使用
+    pgoff_t                 index;
+    struct list_head        lru;
+    void                    *virtual;   // 页的虚拟地址
+};
+```
+
+### 区
+
+有些页位于特定的物理地址上，不能将其用于一些特定的任务，所以，内核吧页划分为不用的区。一般是处理一些硬件存在的缺陷：
+- 一些硬件只能用特定的内存地址来执行DMA（直接内存访问）
+- 一些体系结构物理寻址范围比虚拟地址范围大
+
+故而，Linux使用四个区：
+- ZONE_DMA-包含的页只能用来执行DMA操作(0-16MB for x86)
+- ZONE_DMA32-可以用来执行DMA操作；但是这些页面只能被32位的设备访问。
+- ZONE_NORMAL-能被正常映射的页
+- ZONE_HIGHEM-包含高端内存，期中的页不能永久的映射到内核地址空间(>896MB for x86)
+  
+| 区 | 描述 | 物理内存 |
+| -- | -- | -- |
+| ZONE_DMA | DMA使用的页 | <16MB |
+| ZONE_NORMAL | 正常可寻址的页 | 16 ~ 896MB |
+| ZONE_HIGHMEM | 动态映射的页 | > 896MB |
+
+页分配有两个函数：
+```c
+// alloc
+struct page * alloc_pages(gfp_t gfp_mask, unsigned int order);
+unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order);
+// free
+void __free_pages(struct page *page, unsigned int order);
+void free_pages(unsigned long addr, unsigned int order);
+```
+
+前者返回page结构体，后者返回第一页的逻辑地址。都是分配 `1 << order` 个连续页。
+
+### kmalloc or vmalloc?
+两个细粒度的内存分配函数：`kmalloc` 和 `vmalloc`， 前者分配的内存在物理上是连续的，后者分配的是连续的虚拟地址空间，物理上不一定连续。内核使用时一般采用kmalloc，只有当需要连续的大块内存的时候，采用到vmalloc，通过修改页表，达到逻辑上连续的目的，但是过多这样的数据可能会引起TLB的抖动
+
+### slab层
+
+分配和释放内存对于内核是特别频繁的操作，为了便于回收和利用，一般会用到空闲链表，需要时从链表中去除一块内存，回收时再释放到链表中。但是内核是不知道链表的存在的，内存紧缺时，无法通知其收缩缓存释放一些内存出来。
+
+ 有几个分配的原则：
+
+ - 频繁使用的数据结构应当缓存
+ - 频繁分配和回收必将导致内存碎片问题
+ - 回收的对象可以立即用于下一次分配
+ - 分配器直到对象大小，页大小，和总的高速缓存
+ - 部分缓存专属于单个处理器
+ - 对存放的对象进行着色，防止多个对象映射到相同的高速缓存
+
+#### slab层的设计
+
+slab层把不同的对象划分为所谓的高速缓存组，每个高速缓存组都存储不同的对象，每种对象对应一个高速缓存，例如一个高速缓存用于存放进程描述符，另一个存放索引节点对象。kmalloc接口也是建立在slab层之上，使用通用高速缓存。
+
+高速缓存又被划分为slab，slab由一个或多个连续的物理页组成，每个slab都包含一些对象成员。
+
+![slabobj](./pic/slab_obj.png)
+
+每个高速缓存都使用`kmem_cache`结构表示，包括三个链表:`slabs_full, slabs_partial, slabs_empty`。链表中包含所有的高速缓存中的slab。
+
+```c
+struct slab {
+    struct list_head    list;       
+    unsigned long       colouroff;  // slab着色的偏移
+    void                *s_mem;     // slab中的第一个对象
+    unsigned int        inuse;      // 已分配对象数
+    kmem_bufctl_t       free;       // 第一个空闲对象
+}
+
+static inline void *kmem_getpages(struct kmem_cache *cachep, gfp_t flags) {
+    void *addr;
+    flags |= cachep->gfpflags;
+    addr = (void*)__get_free_pages(flags, cachep->gfporder);
+    return addr;
+}
+```
+
+高速缓存分配器不会频繁的申请和释放页，只有当内存紧缺，或高速缓存被撤销时才会显式的释放页。
+
+```c
+/*
+size: 对象大小
+align: slab内第一个对象偏移
+ctor: 高速缓存构造函数，一般为NULL
+*/
+struct kmem_cache *kmem_cache_create(const char *name, size_t size, size_t align, unsigned long flags, void (*ctor)(void *));
+
+/*
+高速缓存中所有slab都应该为空
+在调用该函数过程中，不在访问该高速缓存
+*/
+int kmem_cache_destroy(struct kmem_cache *cachep);
+
+void *kmem_cache_alloc(struct kmem_cache *cachep, gfp_t flags);
+
+void kmem_cache_free(struct kmem_cache *cachep, void *objp);
+```
