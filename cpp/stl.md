@@ -180,3 +180,4 @@ private:
 ```
 
 将default constructor, copy constructor, assignment constructor全部设为private，就无法创建参数为2的obj，其实也不用设为private，因为特化的obj是一个空类，创建后调用其方法或者成员时就会出错。再进一步，`只要将器默认构造函数设为private即可`，因为参数不同，编译时就是两个类，无法进行copy或者assignment。
+
